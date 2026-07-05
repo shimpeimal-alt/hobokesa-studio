@@ -294,15 +294,18 @@ body{font-family:'Noto Sans JP',sans-serif;background:var(--bg);color:var(--text
       </div>
       <div class="field-label" style="margin-bottom:6px;">新規追加時のデフォルトフレーム数</div>
       <div class="chips" id="frame-chips">
+        <span class="chip sel" onclick="setFrames(this,'auto')">自動（秒数に応じる）</span>
+        <span class="chip" onclick="setFrames(this,1)">1</span>
+        <span class="chip" onclick="setFrames(this,2)">2</span>
         <span class="chip" onclick="setFrames(this,3)">3</span>
         <span class="chip" onclick="setFrames(this,4)">4</span>
-        <span class="chip sel" onclick="setFrames(this,6)">6（デフォルト）</span>
+        <span class="chip" onclick="setFrames(this,6)">6</span>
         <span class="chip" onclick="setFrames(this,8)">8</span>
         <span class="chip" onclick="setFrames(this,10)">10</span>
         <span class="chip" onclick="setFrames(this,12)">12</span>
         <span class="chip" onclick="setFrames(this,15)">15（高精度）</span>
       </div>
-      <div style="font-size:11px;color:var(--text3);margin-top:6px;">※ 動画カード上のスライダーで動画ごとに個別変更できます</div>
+      <div style="font-size:11px;color:var(--text3);margin-top:6px;">※「自動」は動画の秒数に応じて最適なフレーム数を設定します。動画カード上のスライダーで動画ごとに個別変更もできます</div>
     </div>
 
     <!-- Drop zone -->
@@ -344,7 +347,35 @@ body{font-family:'Noto Sans JP',sans-serif;background:var(--bg);color:var(--text
 // ── STATE ──
 let current = null, history = [];
 let snsX = true, snsIG = true;
-let frameCount = 6;
+let frameCount = 'auto';  // 'auto' = 動画秒数に応じて自動決定
+
+// 動画の秒数に応じた推奨フレーム数（短い動画にも対応）
+function suggestFrameCount(duration){
+  if(!duration || !isFinite(duration) || duration <= 0) return 6;
+  if(duration <= 2)  return 1;
+  if(duration <= 4)  return 2;
+  if(duration <= 7)  return 3;
+  if(duration <= 12) return 4;
+  if(duration <= 20) return 6;
+  if(duration <= 35) return 8;
+  if(duration <= 60) return 10;
+  return 12;
+}
+
+// 動画ファイルの秒数を読み取る
+function getVideoDuration(file){
+  return new Promise((resolve) => {
+    const v = document.createElement('video');
+    v.preload = 'metadata'; v.muted = true;
+    const url = URL.createObjectURL(file);
+    v.src = url;
+    v.addEventListener('loadedmetadata', () => {
+      const d = v.duration; URL.revokeObjectURL(url);
+      resolve(isFinite(d) && d > 0 ? d : 0);
+    });
+    v.addEventListener('error', () => { URL.revokeObjectURL(url); resolve(0); });
+  });
+}
 let videoQueue = []; // {id, file, name, duration, status, frames[], result, frameCount}
 
 // ── API KEY ──
@@ -381,6 +412,7 @@ function sw(t){
 function esc(s){ if(!s) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function setTheme(el, v){ document.getElementById('f-theme').value = v; document.querySelectorAll('.chip').forEach(c => c.classList.remove('sel')); el.classList.add('sel'); }
 function setFrames(el, n){ frameCount = n; document.querySelectorAll('#frame-chips .chip').forEach(c => c.classList.remove('sel')); el.classList.add('sel'); }
+function resolveDefaultFrames(duration){ return frameCount === 'auto' ? suggestFrameCount(duration) : frameCount; }
 function toggleSNS(t){
   if(t === 'x'){ snsX = !snsX; document.getElementById('sns-x').className = 'sns-btn' + (snsX ? ' ax' : ''); }
   else { snsIG = !snsIG; document.getElementById('sns-ig').className = 'sns-btn' + (snsIG ? ' aig' : ''); }
@@ -553,13 +585,23 @@ dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
 dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag-over'); addVideos(e.dataTransfer.files); });
 
 function addVideos(files){
+  const added = [];
   Array.from(files).forEach(file => {
     if(!file.type.startsWith('video/')) return;
     const id = Date.now() + Math.random();
-    videoQueue.push({ id, file, name: file.name, size: file.size, duration: null, status: 'wait', frames: [], result: null, frameCount });
+    const item = { id, file, name: file.name, size: file.size, duration: null, status: 'wait', frames: [], result: null, frameCount: (frameCount === 'auto' ? 6 : frameCount) };
+    videoQueue.push(item);
+    added.push(item);
   });
   renderQueue();
   updateVidBtn();
+  // 各動画の秒数を読み取り、秒数に応じたフレーム数を自動設定
+  added.forEach(async (item) => {
+    const dur = await getVideoDuration(item.file);
+    item.duration = dur;
+    if(frameCount === 'auto') item.frameCount = suggestFrameCount(dur);
+    renderQueue();
+  });
 }
 
 function setVideoFrames(id, n){
@@ -598,9 +640,14 @@ function renderQueue(){
       ? `<div class="frame-strip">${v.frames.map(f=>`<img src="${f}">`).join('')}</div>`
       : '';
 
+    const _chars = v.result ? v.result.join('').replace(/[\s。、！？・…「」（）()]/g,'').length : 0;
+    const _target = v.duration ? Math.round(v.duration * 7) : 0;
+    const _lenBadge = (v.result && _target)
+      ? ` <span style="font-size:10px;color:${Math.abs(_chars-_target)<=_target*0.2?'var(--green)':'var(--yellow)'};">（${Math.round(v.duration)}秒 / 目安${_target}字 → 実${_chars}字）</span>`
+      : '';
     const resultHtml = v.result
       ? `<div class="video-result">
-          <div class="vr-label">📝 生成されたナレーション</div>
+          <div class="vr-label">📝 生成されたナレーション${_lenBadge}</div>
           <div class="vr-lines">${v.result.map((line,i)=>`
             <div class="vr-line">
               <span class="vr-num">${String(i+1).padStart(2,'0')}</span>
@@ -630,7 +677,7 @@ function renderQueue(){
       ${v.status === 'wait' || v.status === 'err' ? `
       <div class="vc-frame-row">
         <span class="vc-frame-label">フレーム数</span>
-        <input class="vc-frame-slider" type="range" min="2" max="15" value="${v.frameCount||6}"
+        <input class="vc-frame-slider" type="range" min="1" max="15" value="${v.frameCount||6}"
           oninput="setVideoFrames(${JSON.stringify(v.id)}, +this.value)">
         <span class="vc-frame-val" id="fc-val-${v.id}">${v.frameCount||6}</span>
         <span class="vc-frame-desc" id="fc-desc-${v.id}">${(v.frameCount||6) <= 4 ? '高速' : (v.frameCount||6) <= 7 ? '標準' : (v.frameCount||6) <= 10 ? '高精度' : '最高精度'}</span>
@@ -698,7 +745,7 @@ async function genAllVideos(){
       document.getElementById('vid-status').innerHTML = `<div class="lmsg" style="text-align:center;padding:10px 0;">✍️ ナレーション生成中… <strong>${esc(vi.name)}</strong> (${i+1}/${total})</div>`;
       const playerHint = document.getElementById('vf-player').value.trim();
       const themeHint = document.getElementById('vf-theme').value.trim();
-      const result = await genVideoNarration(apiKey, frames, playerHint, themeHint, vi.name);
+      const result = await genVideoNarration(apiKey, frames, playerHint, themeHint, vi.name, vi.duration);
       vi.result = result.lines; vi.detectedPlayer = result.player_name; vi.status = 'done';
       addToHistory({ ...result, source: 'video', filename: vi.name });
       if(!current) current = { ...result, source: 'video' };
@@ -713,11 +760,26 @@ async function genAllVideos(){
   updateVidBtn();
 }
 
-async function genVideoNarration(apiKey, frameBase64s, playerHint, themeHint, filename){
+async function genVideoNarration(apiKey, frameBase64s, playerHint, themeHint, filename, duration){
   const playerInstruction = playerHint
     ? `この動画に映っている選手は【${playerHint}】です。`
     : `動画を見て、映っている選手が誰かを特定してください。ユニフォーム・番号・体格・プレースタイルなどから判断してください。`;
   const themeInstruction = themeHint ? `動画のテーマ：【${themeHint}】` : '動画の内容から自然なテーマを判断してください。';
+
+  // 動画秒数に応じた文字数指定（1秒あたり約7文字）
+  let lengthInstruction = '';
+  if(duration && isFinite(duration) && duration > 0){
+    const targetChars = Math.round(duration * 7);
+    const lo = Math.max(1, Math.round(targetChars * 0.85));
+    const hi = Math.round(targetChars * 1.15);
+    const lines = Math.max(1, Math.min(10, Math.round(duration / 4)));
+    lengthInstruction = `
+【文字数の指定（最重要）】
+この動画は約${Math.round(duration)}秒です。ナレーション音声の尺を映像に合わせるため、
+台本全体の合計文字数を「1秒あたり約7文字」＝ 約${targetChars}文字（${lo}〜${hi}文字）に収めてください。
+句読点・記号を除いた実質の文字数で数えます。
+行数の目安は${lines}行前後。短い動画では無理に行数を増やさず、簡潔にまとめてください。`;
+  }
 
   const imageBlocks = frameBase64s.map(f => ({
     type: "image",
@@ -729,6 +791,7 @@ async function genVideoNarration(apiKey, frameBase64s, playerHint, themeHint, fi
 ${playerInstruction}
 ${themeInstruction}
 ファイル名：${filename}
+${lengthInstruction}
 
 添付した動画フレームを見て、各シーンでどんなプレー・場面が起きているかを把握してください。
 そのうえで、「ほぼけさ」スタイルのナレーション台本を生成してください。
@@ -737,6 +800,7 @@ ${STYLE_EXAMPLES}
 ${STYLE_RULES}
 
 各行は動画で実際に見えるシーンに基づいて書くこと。動画に映っていないことは書かない。
+${duration ? '※ 上記の「文字数の指定」は台本ルールの行数よりも優先してください。' : ''}
 
 以下のJSON形式のみで返してください（前置き・コードブロック記号なし）:
 {"player_name":"選手名","player_emoji":"絵文字1文字","theme":"テーマ","source":"video","lines":["久保からの完璧なパスを…久保建英。","異次元すぎる久保建英。"]}`;
@@ -769,7 +833,7 @@ async function regenVideo(id){
     }
     const playerHint = document.getElementById('vf-player').value.trim();
     const themeHint = document.getElementById('vf-theme').value.trim();
-    const result = await genVideoNarration(apiKey, frames, playerHint, themeHint, vi.name);
+    const result = await genVideoNarration(apiKey, frames, playerHint, themeHint, vi.name, vi.duration);
     vi.result = result.lines; vi.detectedPlayer = result.player_name; vi.status = 'done';
     addToHistory({ ...result, source:'video', filename:vi.name });
   } catch(e){ vi.status = 'err'; vi.error = e.message; }
