@@ -694,31 +694,59 @@ function renderQueue(){
   }).join('');
 }
 
-// Extract frames from video
+// Extract frames from video（堅牢化：タイムアウト・詳細エラー・非対応コーデック検知）
+const CODEC_HELP = 'ブラウザで再生できない形式です（HEVC/H.265の可能性）。この動画をH.264のMP4に変換してから読み込んでください。'
+  + '（iPhoneの場合：設定→カメラ→フォーマット→「互換性優先」で撮影／録画すると回避できます）';
+
 function extractFrames(file, n){
   return new Promise((resolve, reject) => {
     const video = document.createElement('video');
     const canvas = document.getElementById('frame-canvas');
     const ctx = canvas.getContext('2d');
     const url = URL.createObjectURL(file);
-    video.src = url; video.muted = true;
-    video.addEventListener('loadedmetadata', () => {
+    let settled = false;
+    const cleanup = () => { try{ URL.revokeObjectURL(url); }catch(e){} };
+    const done = (r) => { if(settled) return; settled = true; clearTimeout(overall); cleanup(); resolve(r); };
+    const fail = (msg) => { if(settled) return; settled = true; clearTimeout(overall); cleanup(); reject(new Error(msg)); };
+
+    // 全体タイムアウト（seekが発火せずハングするケースの保険）
+    const overall = setTimeout(() => fail('動画の解析がタイムアウトしました。' + CODEC_HELP), 25000);
+
+    video.muted = true; video.preload = 'auto'; video.playsInline = true;
+
+    video.addEventListener('error', () => {
+      const c = video.error ? video.error.code : 0;
+      const map = {1:'読み込み中断(1)', 2:'ネットワークエラー(2)', 3:'デコード失敗(3)', 4:'非対応の形式(4)'};
+      fail(`動画を読み込めませんでした [${map[c]||'不明('+c+')'}]。` + CODEC_HELP);
+    });
+
+    // loadeddata（実データが読めた）まで待ってから seek すると安定する
+    video.addEventListener('loadeddata', () => {
       const dur = video.duration;
-      if(!isFinite(dur) || dur <= 0){ URL.revokeObjectURL(url); resolve({ duration: 0, frames: [] }); return; }
+      if(!isFinite(dur) || dur <= 0){ done({ duration: 0, frames: [] }); return; }
+      // 映像トラックがデコードできているか（HEVC非対応だと 0 になることがある）
+      if(!video.videoWidth || !video.videoHeight){ fail('映像を取得できませんでした。' + CODEC_HELP); return; }
       canvas.width = 640; canvas.height = 360;
       const times = Array.from({length:n}, (_,i) => (i+0.5) * dur / n);
-      const frames = []; let idx = 0;
+      const frames = []; let idx = 0; let seekTimer = null;
       const captureNext = () => {
-        if(idx >= times.length){ URL.revokeObjectURL(url); resolve({ duration: dur, frames }); return; }
-        video.currentTime = times[idx++];
+        if(seekTimer){ clearTimeout(seekTimer); seekTimer = null; }
+        if(idx >= times.length){ done({ duration: dur, frames }); return; }
+        const t = Math.min(times[idx++], Math.max(0, dur - 0.05));
+        // seekがハングしても4秒で次へ進む保険
+        seekTimer = setTimeout(onSeeked, 4000);
+        video.currentTime = t;
       };
-      video.addEventListener('seeked', () => {
+      const onSeeked = () => {
+        if(seekTimer){ clearTimeout(seekTimer); seekTimer = null; }
         try{ ctx.drawImage(video, 0, 0, 640, 360); frames.push(canvas.toDataURL('image/jpeg', 0.7).split(',')[1]); } catch(e){}
         captureNext();
-      });
+      };
+      video.addEventListener('seeked', () => { if(!seekTimer) return; onSeeked(); });
       captureNext();
     });
-    video.addEventListener('error', () => { URL.revokeObjectURL(url); reject(new Error('動画を読み込めませんでした')); });
+
+    video.src = url;
   });
 }
 
