@@ -750,6 +750,67 @@ function extractFrames(file, n){
   });
 }
 
+// ── ffmpeg.wasm フォールバック（ブラウザが直接デコードできない動画=HEVC等に対応）──
+let _ffmpegInstance = null;
+let _ffmpegLoading = null;
+async function getFFmpeg(onStatus){
+  if(_ffmpegInstance) return _ffmpegInstance;
+  if(_ffmpegLoading) return _ffmpegLoading;
+  _ffmpegLoading = (async () => {
+    if(onStatus) onStatus('🔧 変換エンジンを初回ダウンロード中…（約30MB・初回のみ／2回目以降は高速）');
+    const { FFmpeg } = await import('https://esm.sh/@ffmpeg/ffmpeg@0.12.10');
+    const { toBlobURL } = await import('https://esm.sh/@ffmpeg/util@0.12.1');
+    const ff = new FFmpeg();
+    const base = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
+    await ff.load({
+      coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
+    });
+    _ffmpegInstance = ff;
+    return ff;
+  })();
+  return _ffmpegLoading;
+}
+
+async function extractFramesFFmpeg(file, n, duration, onStatus){
+  const ff = await getFFmpeg(onStatus);
+  const { fetchFile } = await import('https://esm.sh/@ffmpeg/util@0.12.1');
+  if(onStatus) onStatus('🎞 変換エンジンで解析中…');
+  const inName = 'input_' + Date.now() + '.mp4';
+  await ff.writeFile(inName, await fetchFile(file));
+  const dur = (duration && isFinite(duration) && duration > 0) ? duration : 0;
+  const frames = [];
+  for(let i = 0; i < n; i++){
+    const t = dur > 0 ? (i + 0.5) * dur / n : i; // 秒
+    const out = `f${i}.jpg`;
+    try{
+      // -ss を入力前に置くと高速シーク。scale=640:-2 で幅640・偶数高さ
+      await ff.exec(['-ss', t.toFixed(2), '-i', inName, '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '5', out]);
+      const data = await ff.readFile(out);
+      const bytes = new Uint8Array(data);
+      let bin = ''; const chunk = 0x8000;
+      for(let j = 0; j < bytes.length; j += chunk){ bin += String.fromCharCode.apply(null, bytes.subarray(j, j + chunk)); }
+      frames.push(btoa(bin));
+      try{ await ff.deleteFile(out); }catch(e){}
+    }catch(e){ /* このフレームはスキップ */ }
+  }
+  try{ await ff.deleteFile(inName); }catch(e){}
+  if(!frames.length) throw new Error('変換エンジンでもフレームを抽出できませんでした。ファイルが破損しているか、非対応の形式の可能性があります。');
+  return { duration: dur, frames };
+}
+
+// ブラウザ標準を試し、ダメなら ffmpeg.wasm にフォールバック
+async function extractFramesSmart(file, n, knownDuration, onStatus){
+  try{
+    const r = await extractFrames(file, n);
+    if(r.frames && r.frames.length) return r;
+    throw new Error('フレームなし');
+  }catch(e){
+    // ブラウザで直接デコードできない → 変換エンジンで再挑戦
+    return await extractFramesFFmpeg(file, n, knownDuration, onStatus);
+  }
+}
+
 async function genAllVideos(){
   const apiKey = getKey(); if(!apiKey){ alert('APIキーを入力してください'); return; }
   const toProcess = videoQueue.filter(v => v.status === 'wait' || v.status === 'err');
@@ -764,10 +825,11 @@ async function genAllVideos(){
     pf.style.width = ((i / total) * 80) + '%';
     renderQueue();
     try{
-      // Step 1: extract frames
-      document.getElementById('vid-status').innerHTML = `<div class="lmsg" style="text-align:center;padding:10px 0;">🎬 フレーム抽出中… <strong>${esc(vi.name)}</strong> (${i+1}/${total}) · ${vi.frameCount||6}フレーム</div>`;
-      const { duration, frames } = await extractFrames(vi.file, vi.frameCount || 6);
-      vi.duration = duration; vi.frames = frames.map(f => 'data:image/jpeg;base64,' + f);
+      // Step 1: extract frames（標準→失敗時はffmpeg.wasmで再挑戦）
+      const setStatus = (m) => { document.getElementById('vid-status').innerHTML = `<div class="lmsg" style="text-align:center;padding:10px 0;">${esc(m)} <strong>${esc(vi.name)}</strong> (${i+1}/${total})</div>`; };
+      setStatus('🎬 フレーム抽出中…');
+      const { duration, frames } = await extractFramesSmart(vi.file, vi.frameCount || 6, vi.duration, setStatus);
+      vi.duration = duration || vi.duration; vi.frames = frames.map(f => 'data:image/jpeg;base64,' + f);
       renderQueue();
       // Step 2: generate narration
       document.getElementById('vid-status').innerHTML = `<div class="lmsg" style="text-align:center;padding:10px 0;">✍️ ナレーション生成中… <strong>${esc(vi.name)}</strong> (${i+1}/${total})</div>`;
@@ -856,8 +918,9 @@ async function regenVideo(id){
   try{
     let frames = vi.frames.map(f => f.split(',')[1]).filter(Boolean);
     if(!frames.length){
-      const { duration, frames: f2 } = await extractFrames(vi.file, vi.frameCount || 6);
-      vi.duration = duration; vi.frames = f2.map(f=>'data:image/jpeg;base64,'+f); frames = f2;
+      const setStatus = (m) => { document.getElementById('vid-status').innerHTML = `<div class="lmsg" style="text-align:center;padding:10px 0;">${esc(m)} <strong>${esc(vi.name)}</strong></div>`; };
+      const { duration, frames: f2 } = await extractFramesSmart(vi.file, vi.frameCount || 6, vi.duration, setStatus);
+      vi.duration = duration || vi.duration; vi.frames = f2.map(f=>'data:image/jpeg;base64,'+f); frames = f2;
     }
     const playerHint = document.getElementById('vf-player').value.trim();
     const themeHint = document.getElementById('vf-theme').value.trim();
