@@ -6,6 +6,8 @@
 <title>⚽ ほぼけさ風 ショート台本スタジオ</title>
 <!-- COOP/COEPヘッダーを注入し SharedArrayBuffer を有効化（ffmpeg.wasm用・初回のみ自動リロード） -->
 <script src="coi-serviceworker.js"></script>
+<!-- ffmpeg.wasm 0.11 UMD（HEVC等ブラウザ非対応動画のフレーム抽出フォールバック用） -->
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700;900&family=Bebas+Neue&display=swap" rel="stylesheet">
 <style>
@@ -759,17 +761,19 @@ async function getFFmpeg(onStatus){
   if(_ffmpegInstance) return _ffmpegInstance;
   if(_ffmpegLoading) return _ffmpegLoading;
   _ffmpegLoading = (async () => {
-    if(onStatus) onStatus('🔧 変換エンジンを初回ダウンロード中…（約30MB・初回のみ／2回目以降は高速）');
-    const { FFmpeg } = await import('https://esm.sh/@ffmpeg/ffmpeg@0.12.10');
-    const { toBlobURL } = await import('https://esm.sh/@ffmpeg/util@0.12.1');
-    const ff = new FFmpeg();
-    const base = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
-    // Workerはクロスオリジンから直接生成できないため blob URL 化（同一オリジン扱いにする）
-    await ff.load({
-      classWorkerURL: await toBlobURL('https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/worker.js', 'text/javascript'),
-      coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
+    if(typeof FFmpeg === 'undefined' || !FFmpeg.createFFmpeg){
+      throw new Error('変換エンジンを読み込めませんでした（ネットワークをご確認ください）。');
+    }
+    if(!self.crossOriginIsolated){
+      throw new Error('変換エンジンの実行環境が未準備です。ページを一度再読み込み（Ctrl+Shift+R / Cmd+Shift+R）してから再度お試しください。');
+    }
+    if(onStatus) onStatus('🔧 変換エンジンを初回ダウンロード中…（約25MB・初回のみ／2回目以降は高速）');
+    const { createFFmpeg } = FFmpeg;
+    const ff = createFFmpeg({
+      log: false,
+      corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
     });
+    await ff.load();
     _ffmpegInstance = ff;
     return ff;
   })();
@@ -778,10 +782,10 @@ async function getFFmpeg(onStatus){
 
 async function extractFramesFFmpeg(file, n, duration, onStatus){
   const ff = await getFFmpeg(onStatus);
-  const { fetchFile } = await import('https://esm.sh/@ffmpeg/util@0.12.1');
+  const { fetchFile } = FFmpeg;
   if(onStatus) onStatus('🎞 変換エンジンで解析中…');
-  const inName = 'input_' + Date.now() + '.mp4';
-  await ff.writeFile(inName, await fetchFile(file));
+  const inName = 'input_' + Date.now() + (file.name.match(/\.\w+$/) ? file.name.match(/\.\w+$/)[0] : '.mp4');
+  ff.FS('writeFile', inName, await fetchFile(file));
   const dur = (duration && isFinite(duration) && duration > 0) ? duration : 0;
   const frames = [];
   for(let i = 0; i < n; i++){
@@ -789,16 +793,16 @@ async function extractFramesFFmpeg(file, n, duration, onStatus){
     const out = `f${i}.jpg`;
     try{
       // -ss を入力前に置くと高速シーク。scale=640:-2 で幅640・偶数高さ
-      await ff.exec(['-ss', t.toFixed(2), '-i', inName, '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '5', out]);
-      const data = await ff.readFile(out);
-      const bytes = new Uint8Array(data);
+      await ff.run('-ss', t.toFixed(2), '-i', inName, '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '5', out);
+      const data = ff.FS('readFile', out);
+      const bytes = new Uint8Array(data.buffer);
       let bin = ''; const chunk = 0x8000;
       for(let j = 0; j < bytes.length; j += chunk){ bin += String.fromCharCode.apply(null, bytes.subarray(j, j + chunk)); }
       frames.push(btoa(bin));
-      try{ await ff.deleteFile(out); }catch(e){}
+      try{ ff.FS('unlink', out); }catch(e){}
     }catch(e){ /* このフレームはスキップ */ }
   }
-  try{ await ff.deleteFile(inName); }catch(e){}
+  try{ ff.FS('unlink', inName); }catch(e){}
   if(!frames.length) throw new Error('変換エンジンでもフレームを抽出できませんでした。ファイルが破損しているか、非対応の形式の可能性があります。');
   return { duration: dur, frames };
 }
