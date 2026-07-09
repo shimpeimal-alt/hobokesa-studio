@@ -628,7 +628,9 @@ function videoPlayError(el){
 // ── ナレーション⇔映像の同期確認 ──
 // 各行を動画の等分セグメントに割り当て、再生位置に応じて該当行をハイライト＋読み上げ
 // TTSは音が出るまで起動遅延があるため、発話は SPEAK_LEAD 秒だけ先読みして開始する
-const SPEAK_LEAD = 0.32;   // TTS起動遅延の先読み補正（秒）
+const SPEAK_LEAD = 0.32;      // TTS起動遅延の先読み補正（秒）
+const NARRATION_RATE = 1.5;  // 読み上げ速度（映像に追従させるため速め）
+const CATCHUP_GAP = 2;       // 音声がこの行数以上遅れたら現在位置へ追いつく
 function _segIndex(vi, t){
   const dur = vi.duration || 0;
   const n = (vi.result || []).length;
@@ -657,15 +659,19 @@ function syncLoop(id){
   const t = vid.currentTime;
   // ハイライトは実時刻
   _highlight(id, _segIndex(vi, t));
-  // 発話は先読み（起動遅延を先回り）＋キュー方式（前の行を打ち切らず最後まで読む）
+  // 発話：キュー方式で読み切りつつ、遅れすぎたら現在位置へ追いつく
   if(vi._speak){
-    const si = _segIndex(vi, t + SPEAK_LEAD);
-    if(si >= 0 && si === vi._lastSpoken + 1){       // 次の行に進んだ時だけ、順番にキュー追加
-      vi._lastSpoken = si;
-      speakLine(vi.result[si], true);               // queue=true: cancelせず順に読み切る
-    } else if(si > vi._lastSpoken + 1){             // シーク等で飛んだ場合は一旦揃える
-      vi._lastSpoken = si;
-      speakLine(vi.result[si], false);              // 打ち切ってその行から
+    const vidIdx = _segIndex(vi, t);
+    // 実際に鳴っている行(_audioIdx)が映像より CATCHUP_GAP 行以上遅れたら、打ち切って現在行へ
+    if(typeof vi._audioIdx === 'number' && vidIdx - vi._audioIdx >= CATCHUP_GAP){
+      speakItemLine(vi, vidIdx, false);             // cancel＆現在行から
+    } else {
+      const si = _segIndex(vi, t + SPEAK_LEAD);
+      if(si >= 0 && si === vi._lastSpoken + 1){      // 次の行を順にキュー追加（読み切り）
+        speakItemLine(vi, si, true);
+      } else if(si > vi._lastSpoken + 1){            // シーク等で飛んだら合わせ直す
+        speakItemLine(vi, si, false);
+      }
     }
   }
   vi._raf = requestAnimationFrame(() => syncLoop(id));
@@ -678,6 +684,7 @@ function verifyOnPlay(id){
   if('speechSynthesis' in window) speechSynthesis.cancel();   // 停止中に残ったキューを消す
   // 現在の再生位置の「1つ前」に合わせる → 次フレームで現在行から読み始める（seek後もその位置から）
   vi._lastSpoken = _segIndex(vi, vid.currentTime + SPEAK_LEAD) - 1;
+  vi._audioIdx = _segIndex(vi, vid.currentTime);
   if(vi._raf) cancelAnimationFrame(vi._raf);
   vi._raf = requestAnimationFrame(() => syncLoop(id));
 }
@@ -690,7 +697,8 @@ function verifyOnSeek(id){
   _highlight(id, _segIndex(vi, vid.currentTime));
   if('speechSynthesis' in window) speechSynthesis.cancel();
   const si = _segIndex(vi, vid.currentTime + SPEAK_LEAD);
-  if(vi._speak && !vid.paused && si >= 0){ speakLine(vi.result[si], false); vi._lastSpoken = si; }
+  vi._audioIdx = _segIndex(vi, vid.currentTime);
+  if(vi._speak && !vid.paused && si >= 0){ speakItemLine(vi, si, false); }
   else { vi._lastSpoken = si - 1; }
 }
 let _ttsWarmed = false;
@@ -698,14 +706,17 @@ function warmTTS(){
   if(_ttsWarmed || !('speechSynthesis' in window)) return;
   try{ const u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); _ttsWarmed = true; }catch(e){}
 }
-function speakLine(text, queue){
+// idx行を発話。onstartで「実際に鳴り始めた行」を記録し、追いつき判定に使う
+function speakItemLine(vi, idx, queue){
+  vi._lastSpoken = idx;
   if(!('speechSynthesis' in window)) return;
   try{
-    if(!queue) speechSynthesis.cancel();   // queue=trueなら現在の発話を打ち切らず、後ろに繋げて読み切る
-    const u = new SpeechSynthesisUtterance(String(text).replace(/[「」]/g,''));
-    u.lang = 'ja-JP'; u.rate = 1.2; u.pitch = 1.0;
+    if(!queue){ speechSynthesis.cancel(); vi._audioIdx = idx; }   // 打ち切り時は即座に現在行扱い
+    const u = new SpeechSynthesisUtterance(String(vi.result[idx]).replace(/[「」]/g,''));
+    u.lang = 'ja-JP'; u.rate = NARRATION_RATE; u.pitch = 1.0;
     const jp = (speechSynthesis.getVoices() || []).find(v => v.lang && v.lang.toLowerCase().startsWith('ja'));
     if(jp) u.voice = jp;
+    u.onstart = () => { vi._audioIdx = idx; };
     speechSynthesis.speak(u);
   }catch(e){}
 }
