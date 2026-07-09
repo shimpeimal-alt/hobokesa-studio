@@ -168,6 +168,13 @@ body{font-family:'Noto Sans JP',sans-serif;background:var(--bg);color:var(--text
 .vr-copy{font-size:11px;color:var(--text3);cursor:pointer;flex-shrink:0;padding-top:3px;transition:color 0.15s;}
 .vr-copy:hover{color:var(--yellow);}
 .vr-actions{display:flex;gap:6px;margin-top:10px;}
+/* ナレーション確認（動画再生＋台本の横並び） */
+.verify-wrap{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;}
+.verify-video{flex:0 0 auto;position:sticky;top:64px;}
+.verify-video video{width:220px;max-width:62vw;max-height:390px;border-radius:8px;background:#000;display:block;}
+.verify-hint{font-size:10px;color:var(--text3);margin-top:5px;text-align:center;max-width:220px;}
+.verify-lines{flex:1 1 300px;min-width:240px;}
+.verify-noplay{font-size:12px;color:var(--text3);padding:22px 14px;border:1px dashed var(--border2);border-radius:8px;width:220px;text-align:center;line-height:1.6;}
 
 /* VIDEO GEN SETTINGS */
 .vg-settings{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;}
@@ -594,7 +601,7 @@ function addVideos(files){
   Array.from(files).forEach(file => {
     if(!file.type.startsWith('video/')) return;
     const id = Date.now() + Math.random();
-    const item = { id, file, name: file.name, size: file.size, duration: null, status: 'wait', frames: [], result: null, frameCount: (frameCount === 'auto' ? 6 : frameCount) };
+    const item = { id, file, name: file.name, size: file.size, duration: null, status: 'wait', frames: [], result: null, frameCount: (frameCount === 'auto' ? 6 : frameCount), previewUrl: URL.createObjectURL(file) };
     videoQueue.push(item);
     added.push(item);
   });
@@ -607,6 +614,11 @@ function addVideos(files){
     if(frameCount === 'auto') item.frameCount = suggestFrameCount(dur);
     renderQueue();
   });
+}
+
+function videoPlayError(el){
+  const w = el.closest('.verify-video');
+  if(w) w.innerHTML = '<div class="verify-noplay">⚠ この形式はブラウザで直接再生できません（HEVC等）。<br>上のフレーム画像で内容をご確認ください。</div>';
 }
 
 function setVideoFrames(id, n){
@@ -627,6 +639,8 @@ function updateVidBtn(){
 }
 
 function removeVideo(id){
+  const vi = videoQueue.find(v => v.id === id);
+  if(vi && vi.previewUrl){ try{ URL.revokeObjectURL(vi.previewUrl); }catch(e){} }
   videoQueue = videoQueue.filter(v => v.id !== id);
   renderQueue();
   updateVidBtn();
@@ -650,19 +664,29 @@ function renderQueue(){
     const _lenBadge = (v.result && _target)
       ? ` <span style="font-size:10px;color:${Math.abs(_chars-_target)<=_target*0.2?'var(--green)':'var(--yellow)'};">（${Math.round(v.duration)}秒 / 目安${_target}字 → 実${_chars}字）</span>`
       : '';
-    const resultHtml = v.result
-      ? `<div class="video-result">
-          <div class="vr-label">📝 生成されたナレーション${_lenBadge}</div>
-          <div class="vr-lines">${v.result.map((line,i)=>`
+    const _linesHtml = v.result ? v.result.map((line,i)=>`
             <div class="vr-line">
               <span class="vr-num">${String(i+1).padStart(2,'0')}</span>
               <span class="vr-text">${hlName(esc(line), v.detectedPlayer||'')}</span>
               <span class="vr-copy" onclick="copyVidLine(${JSON.stringify(v.id)},${i})" title="コピー">⧉</span>
-            </div>`).join('')}
-          </div>
-          <div class="vr-actions">
-            <button class="btn-sm yl" onclick="copyVidAll(${JSON.stringify(v.id)})">全行コピー</button>
-            <button class="btn-sm" onclick="regenVideo(${JSON.stringify(v.id)})">再生成</button>
+            </div>`).join('') : '';
+    const _videoPlayer = v.previewUrl
+      ? `<div class="verify-video">
+           <video src="${v.previewUrl}" controls playsinline preload="metadata" onerror="videoPlayError(this)"></video>
+           <div class="verify-hint">▶ 再生してナレーションと一致するか確認</div>
+         </div>` : '';
+    const resultHtml = v.result
+      ? `<div class="video-result">
+          <div class="vr-label">📝 ナレーション確認（動画を再生しながらチェック）${_lenBadge}</div>
+          <div class="verify-wrap">
+            ${_videoPlayer}
+            <div class="verify-lines">
+              <div class="vr-lines">${_linesHtml}</div>
+              <div class="vr-actions">
+                <button class="btn-sm yl" onclick="copyVidAll(${JSON.stringify(v.id)})">全行コピー</button>
+                <button class="btn-sm" onclick="regenVideo(${JSON.stringify(v.id)})">再生成</button>
+              </div>
+            </div>
           </div>
         </div>`
       : '';
