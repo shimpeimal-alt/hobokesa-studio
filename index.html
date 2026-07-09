@@ -656,7 +656,7 @@ function speakLine(text){
   try{
     speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(String(text).replace(/[「」]/g,''));
-    u.lang = 'ja-JP'; u.rate = 1.15; u.pitch = 1.0;
+    u.lang = 'ja-JP'; u.rate = 1.2; u.pitch = 1.0;
     const jp = (speechSynthesis.getVoices() || []).find(v => v.lang && v.lang.toLowerCase().startsWith('ja'));
     if(jp) u.voice = jp;
     speechSynthesis.speak(u);
