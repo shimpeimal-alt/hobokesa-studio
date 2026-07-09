@@ -161,7 +161,11 @@ body{font-family:'Noto Sans JP',sans-serif;background:var(--bg);color:var(--text
 .video-result{padding:12px 16px;border-top:1px solid var(--border);}
 .vr-label{font-size:10px;font-weight:700;color:var(--text3);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px;}
 .vr-lines{display:flex;flex-direction:column;gap:0;}
-.vr-line{display:flex;align-items:flex-start;gap:8px;padding:8px 0;border-bottom:1px dashed var(--border);}
+.vr-line{display:flex;align-items:flex-start;gap:8px;padding:8px 6px;border-bottom:1px dashed var(--border);border-radius:6px;transition:background 0.15s;cursor:pointer;}
+.vr-line.active{background:rgba(245,197,24,0.16);}
+.vr-line.active .vr-text{color:var(--yellow);font-weight:700;}
+.verify-sync-row{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap;}
+.verify-sync-lbl{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer;}
 .vr-line:last-child{border-bottom:none;}
 .vr-num{width:24px;font-size:10px;color:var(--text3);font-family:monospace;flex-shrink:0;padding-top:3px;}
 .vr-text{flex:1;font-size:13px;color:var(--text);line-height:1.65;}
@@ -621,6 +625,61 @@ function videoPlayError(el){
   if(w) w.innerHTML = '<div class="verify-noplay">⚠ この形式はブラウザで直接再生できません（HEVC等）。<br>上のフレーム画像で内容をご確認ください。</div>';
 }
 
+// ── ナレーション⇔映像の同期確認 ──
+// 各行を動画の等分セグメントに割り当て、再生位置に応じて該当行をハイライト＋読み上げ
+function _segIndex(vi, t){
+  const dur = vi.duration || 0;
+  const n = (vi.result || []).length;
+  if(!dur || !n) return -1;
+  return Math.min(n - 1, Math.max(0, Math.floor(t / (dur / n))));
+}
+function verifyTick(videoEl, id){
+  const vi = videoQueue.find(v => v.id === id);
+  if(!vi || !vi.result || !vi.result.length) return;
+  if(!vi.duration && videoEl.duration) vi.duration = videoEl.duration;
+  const idx = _segIndex(vi, videoEl.currentTime);
+  const card = document.getElementById('vc-' + id);
+  if(!card) return;
+  card.querySelectorAll('.verify-lines .vr-line').forEach((el, i) => el.classList.toggle('active', i === idx));
+  // 読み上げON時、行が切り替わった瞬間に発話
+  if(vi._speak && idx >= 0 && idx !== vi._lastSpoken){
+    vi._lastSpoken = idx;
+    speakLine(vi.result[idx]);
+  }
+}
+function verifyOnPlay(id){
+  const vi = videoQueue.find(v => v.id === id);
+  if(vi){ vi._lastSpoken = -1; }
+}
+function speakLine(text){
+  if(!('speechSynthesis' in window)) return;
+  try{
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(String(text).replace(/[「」]/g,''));
+    u.lang = 'ja-JP'; u.rate = 1.15; u.pitch = 1.0;
+    const jp = (speechSynthesis.getVoices() || []).find(v => v.lang && v.lang.toLowerCase().startsWith('ja'));
+    if(jp) u.voice = jp;
+    speechSynthesis.speak(u);
+  }catch(e){}
+}
+function toggleSpeak(id, on){
+  const vi = videoQueue.find(v => v.id === id);
+  if(!vi) return;
+  vi._speak = on; vi._lastSpoken = -1;
+  const vid = document.getElementById('vid-' + id);
+  if(vid) vid.muted = on;  // 読み上げ中は動画の元音声をミュートして聞き取りやすく
+  if(!on && 'speechSynthesis' in window) speechSynthesis.cancel();
+}
+function seekToLine(id, i){
+  const vi = videoQueue.find(v => v.id === id);
+  const vid = document.getElementById('vid-' + id);
+  if(!vi || !vid || !vi.duration || !vi.result.length) return;
+  vid.currentTime = (vi.duration / vi.result.length) * i + 0.05;
+  vid.play().catch(()=>{});
+}
+// 音声リストの遅延ロード対策
+if('speechSynthesis' in window){ speechSynthesis.onvoiceschanged = () => {}; }
+
 function setVideoFrames(id, n){
   const vi = videoQueue.find(v => v.id === id);
   if(vi){ vi.frameCount = n; }
@@ -665,15 +724,24 @@ function renderQueue(){
       ? ` <span style="font-size:10px;color:${Math.abs(_chars-_target)<=_target*0.2?'var(--green)':'var(--yellow)'};">（${Math.round(v.duration)}秒 / 目安${_target}字 → 実${_chars}字）</span>`
       : '';
     const _linesHtml = v.result ? v.result.map((line,i)=>`
-            <div class="vr-line">
+            <div class="vr-line" id="vrl-${v.id}-${i}" onclick="seekToLine(${JSON.stringify(v.id)},${i})" title="クリックでこの行の映像へ移動">
               <span class="vr-num">${String(i+1).padStart(2,'0')}</span>
               <span class="vr-text">${hlName(esc(line), v.detectedPlayer||'')}</span>
-              <span class="vr-copy" onclick="copyVidLine(${JSON.stringify(v.id)},${i})" title="コピー">⧉</span>
+              <span class="vr-copy" onclick="event.stopPropagation();copyVidLine(${JSON.stringify(v.id)},${i})" title="コピー">⧉</span>
             </div>`).join('') : '';
     const _videoPlayer = v.previewUrl
       ? `<div class="verify-video">
-           <video src="${v.previewUrl}" controls playsinline preload="metadata" onerror="videoPlayError(this)"></video>
-           <div class="verify-hint">▶ 再生してナレーションと一致するか確認</div>
+           <video id="vid-${v.id}" src="${v.previewUrl}" controls playsinline preload="metadata"
+                  onerror="videoPlayError(this)"
+                  ontimeupdate="verifyTick(this,${JSON.stringify(v.id)})"
+                  onplay="verifyOnPlay(${JSON.stringify(v.id)})"
+                  onseeked="verifyTick(this,${JSON.stringify(v.id)})"></video>
+           <div class="verify-hint">▶ 再生すると話している行が光ります</div>
+           <div class="verify-sync-row">
+             <label class="verify-sync-lbl">
+               <input type="checkbox" onchange="toggleSpeak(${JSON.stringify(v.id)}, this.checked)"> 🔊 ナレーションを読み上げて確認
+             </label>
+           </div>
          </div>` : '';
     const resultHtml = v.result
       ? `<div class="video-result">
