@@ -338,8 +338,9 @@ body{font-family:'Noto Sans JP',sans-serif;background:var(--bg);color:var(--text
     <!-- Batch generate -->
     <button class="vid-gen-btn" id="vid-gen-btn" onclick="genAllVideos()" disabled style="margin-bottom:18px;">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-      全動画のナレーションを生成
+      全動画を1本のストーリーにする
     </button>
+    <div style="font-size:11px;color:var(--text3);text-align:center;margin:-10px 0 18px;">※ ドロップした全動画をAIがまとめて分析し、1つの物語としてナレーションを生成します（各動画の長さに合わせて空白なく構成）</div>
 
     <div class="pb"><div class="pf" id="pf-video" style="width:0%"></div></div>
     <div id="vid-status"></div>
@@ -972,43 +973,135 @@ async function extractFramesSmart(file, n, knownDuration, onStatus){
   }
 }
 
+// 配列を n 個に均等サンプリング
+function _subsample(arr, n){
+  if(arr.length <= n) return arr.slice();
+  const out = []; for(let i = 0; i < n; i++){ out.push(arr[Math.floor(i * arr.length / n)]); }
+  return out;
+}
+
 async function genAllVideos(){
   const apiKey = getKey(); if(!apiKey){ alert('APIキーを入力してください'); return; }
   const toProcess = videoQueue.filter(v => v.status === 'wait' || v.status === 'err');
   if(!toProcess.length) return;
   const btn = document.getElementById('vid-gen-btn'); btn.disabled = true;
   const pf = document.getElementById('pf-video'); pf.style.width = '0%';
+  const setStatus = (m) => { document.getElementById('vid-status').innerHTML = `<div class="lmsg" style="text-align:center;padding:10px 0;">${m}</div>`; };
   const total = toProcess.length;
+  const playerHint = document.getElementById('vf-player').value.trim();
+  const themeHint = document.getElementById('vf-theme').value.trim();
+
+  // ── フェーズ1：全動画のフレーム抽出 ──
+  const prepared = [];   // {vi, duration, frames(raw base64)}
   for(let i = 0; i < toProcess.length; i++){
-    const v = toProcess[i];
-    const vi = videoQueue.find(x => x.id === v.id); if(!vi) continue;
-    vi.status = 'proc'; vi.error = null;
-    pf.style.width = ((i / total) * 80) + '%';
-    renderQueue();
+    const vi = videoQueue.find(x => x.id === toProcess[i].id); if(!vi) continue;
+    vi.status = 'proc'; vi.error = null; pf.style.width = ((i / total) * 45) + '%'; renderQueue();
     try{
-      // Step 1: extract frames（標準→失敗時はffmpeg.wasmで再挑戦）
-      const setStatus = (m) => { document.getElementById('vid-status').innerHTML = `<div class="lmsg" style="text-align:center;padding:10px 0;">${esc(m)} <strong>${esc(vi.name)}</strong> (${i+1}/${total})</div>`; };
-      setStatus('🎬 フレーム抽出中…');
-      const { duration, frames } = await extractFramesSmart(vi.file, vi.frameCount || 6, vi.duration, setStatus);
-      vi.duration = duration || vi.duration; vi.frames = frames.map(f => 'data:image/jpeg;base64,' + f);
-      renderQueue();
-      // Step 2: generate narration
-      document.getElementById('vid-status').innerHTML = `<div class="lmsg" style="text-align:center;padding:10px 0;">✍️ ナレーション生成中… <strong>${esc(vi.name)}</strong> (${i+1}/${total})</div>`;
-      const playerHint = document.getElementById('vf-player').value.trim();
-      const themeHint = document.getElementById('vf-theme').value.trim();
-      const result = await genVideoNarration(apiKey, frames, playerHint, themeHint, vi.name, vi.duration);
-      vi.result = result.lines; vi.detectedPlayer = result.player_name; vi.status = 'done';
-      addToHistory({ ...result, source: 'video', filename: vi.name });
-      if(!current) current = { ...result, source: 'video' };
-    } catch(e){
-      vi.status = 'err'; vi.error = e.message;
-    }
+      setStatus(`🎬 フレーム抽出中… <strong>${esc(vi.name)}</strong> (${i+1}/${total})`);
+      const { duration, frames } = await extractFramesSmart(vi.file, vi.frameCount || 6, vi.duration, (m)=>setStatus(m));
+      vi.duration = duration || vi.duration;
+      vi.frames = frames.map(f => 'data:image/jpeg;base64,' + f);
+      prepared.push({ vi, duration: vi.duration || 0, frames });
+    }catch(e){ vi.status = 'err'; vi.error = e.message; }
     renderQueue();
   }
-  pf.style.width = '100%';
-  document.getElementById('vid-status').innerHTML = `<div class="lmsg" style="text-align:center;padding:10px 0;color:var(--green);">✓ 全動画の生成が完了しました</div>`;
-  setTimeout(() => { pf.style.transition = 'none'; pf.style.width = '0%'; setTimeout(() => pf.style.transition = 'width 0.4s', 100); }, 2000);
+  if(!prepared.length){
+    setStatus('<span style="color:var(--red)">フレームを抽出できる動画がありませんでした。</span>');
+    updateVidBtn(); return;
+  }
+
+  // ── フェーズ2：全動画をまとめて1つのストーリーとして生成（1回のAI呼び出し）──
+  pf.style.width = '60%';
+  setStatus(`🎬 AIが${prepared.length}本の動画を分析し、1本のストーリーを構成中…`);
+  // 総フレーム数を抑えるため、動画あたりの枚数を調整
+  const perVid = Math.max(2, Math.min(6, Math.floor(42 / prepared.length)));
+  const videosData = prepared.map((p, idx) => ({
+    index: idx + 1,
+    duration: p.duration || 0,
+    name: p.vi.name,
+    frames: _subsample(p.frames, perVid),
+  }));
+
+  try{
+    const story = await genStoryNarration(apiKey, videosData, playerHint, themeHint);
+    pf.style.width = '90%';
+    // 各動画に台本を割り当て
+    const byIndex = {};
+    (story.videos || []).forEach(sv => { if(sv && sv.index) byIndex[sv.index] = sv.lines || []; });
+    const flat = [];
+    prepared.forEach((p, idx) => {
+      const lines = byIndex[idx + 1];
+      if(lines && lines.length){
+        p.vi.result = lines; p.vi.detectedPlayer = story.player_name || ''; p.vi.status = 'done';
+        flat.push(...lines);
+      } else {
+        p.vi.status = 'err'; p.vi.error = 'このシーンの台本が生成されませんでした。再生成をお試しください。';
+      }
+    });
+    // 全体ストーリーを current / 履歴に
+    current = { source: 'video', story: true, player_name: story.player_name, player_emoji: story.player_emoji,
+                theme: story.story_theme || themeHint || 'ストーリー', lines: flat };
+    addToHistory({ ...current, filename: `ストーリー（${prepared.length}本）` });
+    pf.style.width = '100%';
+    const okCount = prepared.filter(p => p.vi.status === 'done').length;
+    setStatus(`<span style="color:var(--green)">✓ 1本のストーリーとして生成完了（${okCount}/${prepared.length}シーン）</span>`
+      + (story.story_theme ? `<div style="font-size:12px;color:var(--text2);margin-top:6px;">📖 ${esc(story.story_theme)}</div>` : ''));
+  }catch(e){
+    prepared.forEach(p => { if(p.vi.status !== 'done'){ p.vi.status = 'err'; p.vi.error = e.message; } });
+    setStatus(`<span style="color:var(--red)">ストーリー生成に失敗しました：${esc(e.message)}</span>`);
+  }
+  renderQueue();
+  setTimeout(() => { pf.style.transition = 'none'; pf.style.width = '0%'; setTimeout(() => pf.style.transition = 'width 0.4s', 100); }, 2500);
   updateVidBtn();
+}
+
+// 全動画をまとめて1本のストーリー台本として生成（1回のAPI呼び出し）
+async function genStoryNarration(apiKey, videosData, playerHint, themeHint){
+  const subjectInstruction = playerHint
+    ? `主な被写体は【${playerHint}】です（選手・チーム・サポーター等）。他の人物が映る場面では実際の被写体に合わせてください。`
+    : `各シーンの被写体は映像から判断してください（特定の選手／複数選手／サポーター／監督／主審 など）。`;
+  const themeInstruction = themeHint ? `全体のテーマ：【${themeHint}】` : '動画全体から自然なテーマ・物語を判断してください。';
+  const nV = videosData.length;
+
+  const head = `あなたはサッカーYouTubeショート動画の構成作家 兼 ナレーション作家です。
+これから ${nV}本の短い動画を順番に見せます。これらを1本につなげたときに、全体が「1つのストーリー（ドラマ）」として成立するナレーション台本を作ってください。
+
+${subjectInstruction}
+${themeInstruction}
+
+【最重要ルール】
+1. 全体で1本のストーリーにする：導入→盛り上がり→クライマックス→締め、の流れ（起承転結）を作る。各動画はその物語の「1シーン」。前のシーンから次のシーンへ自然につながるように、展開・感情の起伏を意識する。バラバラの実況の寄せ集めにしない。
+2. 各シーン（動画）のナレーション量は、その動画の長さ(秒)ちょうどに合わせる：1秒あたり約7文字。動画が8秒なら合計約56文字。音声にしたとき動画の尺いっぱいにナレーションが入り、無音の空白ができないようにする。短すぎ（スカスカ）も長すぎ（はみ出す）もNG。各シーンごとに文字数を必ず守ること。
+3. 事実に忠実：映像に映っていないこと（見えないゴール・数えられない人数など）は書かない。口調・トーンで盛るのはOKだが、事実の捏造はNG。
+4. 「ほぼけさ」風のカジュアルでコミカルな口調。各行は自然に読める短文にする。
+5. 各行の文末は、その場面の被写体（選手名やサポーター等）で締めると統一感が出る。
+
+このあと、動画1・動画2… の順にフレーム画像を添付します（各動画の長さも示します）。`;
+
+  const tail = `以上です。全${nV}本を1つの物語としてまとめ、以下のJSON形式のみで返してください（前置き・コードブロック記号なし）。
+各 index は動画番号に対応し、lines はその動画で読み上げるナレーション（順番どおりの配列）。各動画の lines の合計文字数（句読点除く）は「その動画の長さ×約7文字」に合わせること。
+{"story_theme":"物語全体の要約（1文）","player_name":"主役（選手名など）","player_emoji":"絵文字1文字","videos":[{"index":1,"lines":["…","…"]},{"index":2,"lines":["…"]}]}`;
+
+  // content配列：説明→（動画ラベル＋画像）×N→締め
+  const content = [{ type: 'text', text: head }];
+  videosData.forEach(v => {
+    const chars = Math.round((v.duration || 0) * 7);
+    content.push({ type: 'text', text: `\n━━━ 動画${v.index}（長さ ${Math.round(v.duration||0)}秒 / ナレーション目安 約${chars}文字）━━━` });
+    v.frames.forEach(f => content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: f } }));
+  });
+  content.push({ type: 'text', text: tail });
+
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+    body: JSON.stringify({ model: "claude-opus-4-8", max_tokens: 4000, messages: [{ role: "user", content }] })
+  });
+  if(!resp.ok){ const e = await resp.json(); throw new Error(e.error?.message || resp.statusText); }
+  const data = await resp.json();
+  const txt = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+  const j1 = txt.indexOf('{'), j2 = txt.lastIndexOf('}');
+  if(j1 < 0 || j2 < 0) throw new Error('JSONが見つかりません');
+  return JSON.parse(txt.slice(j1, j2 + 1));
 }
 
 async function genVideoNarration(apiKey, frameBase64s, playerHint, themeHint, filename, duration){
